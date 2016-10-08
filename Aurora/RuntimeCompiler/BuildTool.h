@@ -31,7 +31,7 @@ public:
 	void Initialise( ICompilerLogger * pLogger );
 
     // Clean - cleans up the intermediate files
-    void Clean() const;
+    void Clean( const FileSystemUtils::Path& temporaryPath_ ) const;
 
 	struct FileToBuild
 	{
@@ -49,14 +49,11 @@ public:
 		bool					forceCompile; //if true the file is compiled even if object file is present
 	};
 
-	void BuildModule( const std::vector<FileToBuild>& buildFileList, 
-					  const std::vector<FileSystemUtils::Path>& includeDirList, 
-					  const std::vector<FileSystemUtils::Path>& libraryDirList,
-					  const std::vector<FileSystemUtils::Path>& linkLibraryList,
-					  RCppOptimizationLevel optimizationLevel_,
-					  const char* pCompileOptions,
-					  const char* pLinkOptions,
-					  const FileSystemUtils::Path& moduleName );
+	void BuildModule( const std::vector<FileToBuild>&		buildFileList_, 
+					  const CompilerOptions&				compilerOptions_,
+					  std::vector<FileSystemUtils::Path>	linkLibraryList_,
+                      const FileSystemUtils::Path&			moduleName_ );
+
 	bool GetIsComplete()
 	{
 		return m_Compiler.GetIsComplete();

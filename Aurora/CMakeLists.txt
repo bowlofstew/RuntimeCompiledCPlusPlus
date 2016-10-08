@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 2.8)
 
+project( RuntimeCompiledCPlusPlus )
 #
 # Options
 #
@@ -8,7 +9,7 @@ option(GLFW_SYSTEM    "Use the operating system glfw library" OFF)
 
 find_package(OpenGL REQUIRED)
 
-if(UNIX)
+if(UNIX AND NOT APPLE)
 	set(BUILD_TYPE SHARED)
 else()
 	set(BUILD_TYPE STATIC)
@@ -32,6 +33,16 @@ target_link_libraries(RuntimeObjectSystem RuntimeCompiler)
 if(UNIX)
 	target_link_libraries(RuntimeObjectSystem dl)
 endif()
+
+#
+# Make Install
+#
+install(DIRECTORY RuntimeObjectSystem/ DESTINATION ${CMAKE_INSTALL_PREFIX}/include/RuntimeObjectSystem
+	FILES_MATCHING PATTERN "*.h")
+install(DIRECTORY RuntimeCompiler/ DESTINATION ${CMAKE_INSTALL_PREFIX}/include/RuntimeCompiler
+	FILES_MATCHING PATTERN "*.h")
+install(TARGETS RuntimeObjectSystem RuntimeCompiler 
+	DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/)
 
 if(BUILD_EXAMPLES)
 
@@ -67,6 +78,12 @@ if(BUILD_EXAMPLES)
 		else()
 			set(FREETYPE_LIBRARY ${CMAKE_SOURCE_DIR}/External/support/lib/freetype2410MT.lib)
 		endif()
+	elseif(APPLE)
+		set(FREETYPE_INCLUDE_DIR_freetype2 ${CMAKE_SOURCE_DIR}/External/support/freetype/include/freetype)
+		set(FREETYPE_INCLUDE_DIR_ft2build ${CMAKE_SOURCE_DIR}/External/support/freetype/include)
+		FIND_LIBRARY(ZLIB_LIBRARY libs)
+		MARK_AS_ADVANCED(ZLIB_LIBRARY)
+		set(FREETYPE_LIBRARY ${CMAKE_SOURCE_DIR}/External/support/lib/MacOSX/libfreetype.a ${ZLIB_LIBRARY})
 	endif()
 
 	#
@@ -76,20 +93,21 @@ if(BUILD_EXAMPLES)
 		set(GLFW_LIBRARIES glfw)
 	else()
 		include_directories(External/glfw/include)
-		add_library( glfw STATIC IMPORTED )
-		if(APPLE)
-			set_target_properties( glfw PROPERTIES IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/External/glfw/libOSX/libglfw.a )
-			set(GLFW_LIBRARIES glfw)
-		elseif(WIN32)
-			set(GLFW_LIBRARIES glfw)
-			if(${CMAKE_CL_64})
-				set_target_properties( glfw PROPERTIES IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/External/glfw/libWin/GLFWx64.lib )
-			else()
-				set_target_properties( glfw PROPERTIES IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/External/glfw/libWin/GLFWx86.lib )
-			endif()
+		if(WIN32)
+				set(GLFW_LIBRARIES glfw winmm)
+				add_subdirectory( ${CMAKE_SOURCE_DIR}/External/glfw/projects )
 		else()
-			set_target_properties( glfw PROPERTIES IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/External/glfw/libX11/libglfw.a )
-			set(GLFW_LIBRARIES glfw X11 pthread)
+			add_library( glfw STATIC IMPORTED )
+			if(APPLE)
+				FIND_LIBRARY(COCOA_LIBRARY Cocoa)
+				FIND_LIBRARY(IOKIT_LIBRARY IOKit)
+				MARK_AS_ADVANCED(COCOA_LIBRARY IOKIT_LIBRARY)
+				set_target_properties( glfw PROPERTIES IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/External/glfw/libOSX/libglfw.a )
+				set(GLFW_LIBRARIES glfw ${COCOA_LIBRARY} ${IOKIT_LIBRARY})
+			else()
+				set_target_properties( glfw PROPERTIES IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/External/glfw/libX11/libglfw.a )
+				set(GLFW_LIBRARIES glfw X11 pthread)
+			endif()
 		endif()
 	endif()
 
@@ -102,10 +120,17 @@ if(BUILD_EXAMPLES)
 		set(ASSIMP_LIBRARIES assimp)
 		if(${CMAKE_CL_64})
 			set_target_properties( assimp PROPERTIES IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/External/assimp/lib/assimp_release-dll_x64/assimp.lib )
-			file(COPY ${CMAKE_SOURCE_DIR}/External/assimp/bin/assimp_release-dll_win32/Assimp64.dll DESTINATION ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_BUILD_TYPE})
+			set(ASSIMP_DLL ${CMAKE_SOURCE_DIR}/External/assimp/bin/assimp_release-dll_win32/Assimp64.dll)
 		else()
 			set_target_properties( assimp PROPERTIES IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/External/assimp/lib/assimp_release-dll_win32/assimp.lib )
-			file(COPY ${CMAKE_SOURCE_DIR}/External/assimp/bin/assimp_release-dll_win32/Assimp32.dll DESTINATION ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_BUILD_TYPE})
+			set(ASSIMP_DLL ${CMAKE_SOURCE_DIR}/External/assimp/bin/assimp_release-dll_win32/Assimp32.dll)
+		endif()
+		if(CMAKE_GENERATOR STREQUAL "NMake Makefiles")
+			file(COPY ${ASSIMP_DLL} DESTINATION ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
+		else()
+			foreach( OUTPUTCONFIG ${CMAKE_CONFIGURATION_TYPES} )
+				file(COPY ${ASSIMP_DLL} DESTINATION ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${OUTPUTCONFIG})
+			endforeach( OUTPUTCONFIG CMAKE_CONFIGURATION_TYPES )
 		endif()
 	endif()
 
@@ -136,5 +161,9 @@ if(BUILD_EXAMPLES)
 			${GLFW_LIBRARIES}
 			${ASSIMP_LIBRARIES}
 		)
-	
+	if(MSVC)
+		set_target_properties(SimpleTest ConsoleExample PROPERTIES COMPILE_FLAGS "/FC")
+	else()
+		Set(CMAKE_CXX_FLAGS  "-DCOMPILE_PATH=\"\\\"$(PWD)\\\"\"")
+	endif()
 endif()

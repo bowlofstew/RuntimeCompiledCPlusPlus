@@ -426,10 +426,10 @@ int ObjectFactorySystem::GetObjectConstructorHistorySize()
 
 bool ObjectFactorySystem::UndoObjectConstructorChange()
 {
-	if( m_HistoryCurrentLocation < m_HistoryConstructors.size() )
+	if( m_HistoryCurrentLocation < (int)m_HistoryConstructors.size() )
 	{
 		++m_HistoryCurrentLocation;
-		int loc = m_HistoryConstructors.size() - m_HistoryCurrentLocation;
+		size_t loc = m_HistoryConstructors.size() - m_HistoryCurrentLocation;
 		return HandleRedoUndo( m_HistoryConstructors[ loc ].before );
 	}
 
@@ -440,7 +440,7 @@ bool ObjectFactorySystem::RedoObjectConstructorChange()
 {
 	if( m_HistoryCurrentLocation > 0 )
 	{
-		int loc = m_HistoryConstructors.size() - m_HistoryCurrentLocation;
+		size_t loc = m_HistoryConstructors.size() - m_HistoryCurrentLocation;
 		--m_HistoryCurrentLocation;
 		return HandleRedoUndo( m_HistoryConstructors[ loc ].after );
 	}

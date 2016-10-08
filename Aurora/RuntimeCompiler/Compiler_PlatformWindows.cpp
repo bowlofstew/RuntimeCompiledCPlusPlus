@@ -89,7 +89,7 @@ public:
 		//redirection of output
 		si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
 		si.wShowWindow = SW_HIDE;
-		HANDLE hOutputReadTmp,hOutputWrite;
+		HANDLE hOutputReadTmp = NULL, hOutputWrite  = NULL, hErrorWrite = NULL;
 		if (!CreatePipe(&hOutputReadTmp,&hOutputWrite,&sa,20*1024))
 		{
 			if( m_pLogger ) m_pLogger->LogError("[RuntimeCompiler] Failed to create output redirection pipe\n");
@@ -100,7 +100,6 @@ public:
 		// Create a duplicate of the output write handle for the std error
 		// write handle. This is necessary in case the child application
 		// closes one of its std output handles.
-		HANDLE hErrorWrite;
 		if (!DuplicateHandle(GetCurrentProcess(),hOutputWrite,
 							   GetCurrentProcess(),&hErrorWrite,0,
 							   TRUE,DUPLICATE_SAME_ACCESS))
@@ -115,22 +114,23 @@ public:
 		// the Properties to FALSE. Otherwise, the child inherits the
 		// properties and, as a result, non-closeable handles to the pipes
 		// are created.
- 		HANDLE hOutputRead;
  		if( si.hStdOutput )
 		{
 			 if (!DuplicateHandle(GetCurrentProcess(),hOutputReadTmp,
 								   GetCurrentProcess(),
-								   &hOutputRead, // Address of new handle.
+								   &m_CmdProcessOutputRead, // Address of new handle.
 								   0,FALSE, // Make it uninheritable.
 								   DUPLICATE_SAME_ACCESS))
 			 {
 				   if( m_pLogger ) m_pLogger->LogError("[RuntimeCompiler] Failed to duplicate output read pipe\n");
 				   goto ERROR_EXIT;
 			 }
+			CloseHandle( hOutputReadTmp );
+			hOutputReadTmp = NULL;
 		}
 
 
-		HANDLE hInputRead,hInputWriteTmp,hInputWrite;
+		HANDLE hInputRead,hInputWriteTmp;
 		// Create a pipe for the child process's STDIN. 
 		if (!CreatePipe(&hInputRead, &hInputWriteTmp, &sa, 4096))
 		{
@@ -147,7 +147,7 @@ public:
 		{
 			 if (!DuplicateHandle(GetCurrentProcess(),hInputWriteTmp,
 								   GetCurrentProcess(),
-								   &hInputWrite, // Address of new handle.
+								   &m_CmdProcessInputWrite, // Address of new handle.
 								   0,FALSE, // Make it uninheritable.
 								   DUPLICATE_SAME_ACCESS))
 			 {
@@ -181,11 +181,6 @@ public:
 			  &m_CmdProcessInfo				//__out        LPPROCESS_INFORMATION lpProcessInformation
 			);
 
-
-
-		m_CmdProcessInputWrite = hInputWrite;
-		m_CmdProcessOutputRead = hOutputRead;
-
 		//send initial set up command
 		WriteInput( m_CmdProcessInputWrite, cmdSetParams );
 
@@ -194,12 +189,18 @@ public:
 
 
 	ERROR_EXIT:
-		CloseHandle( hOutputReadTmp );
-		hOutputReadTmp = NULL;
-		CloseHandle( hOutputWrite );
-		hOutputWrite = NULL;
-		CloseHandle( hErrorWrite );
-		hErrorWrite = NULL;
+		if( hOutputReadTmp ) 
+		{
+			CloseHandle( hOutputReadTmp );
+		}
+		if( hOutputWrite ) 
+		{
+			CloseHandle( hOutputWrite );
+		}
+		if( hErrorWrite )
+		{
+			CloseHandle( hErrorWrite );
+		}
 	}
 
     void CleanupProcessAndPipes()
@@ -226,7 +227,6 @@ public:
     }
 
 	std::string			m_VSPath;
-	std::string			m_intermediatePath;
 	PROCESS_INFORMATION m_CmdProcessInfo;
 	HANDLE				m_CmdProcessOutputRead;
 	HANDLE				m_CmdProcessInputWrite;
@@ -280,25 +280,13 @@ void Compiler::Initialise( ICompilerLogger * pLogger )
             m_pImplData->m_pLogger->LogError("No Supported Compiler for RCC++ found.\n");
         }
     }
-
-    FileSystemUtils::Path intermediatePath = FileSystemUtils::GetCurrentPath() / "Runtime";
-    m_pImplData->m_intermediatePath = intermediatePath.m_string;
-}
-
-FileSystemUtils::Path Compiler::GetRuntimeIntermediatePath() const
-{
-    return m_pImplData->m_intermediatePath;
 }
 
 
-void Compiler::RunCompile( const std::vector<FileSystemUtils::Path>& filesToCompile,
-					 const std::vector<FileSystemUtils::Path>& includeDirList,
-					 const std::vector<FileSystemUtils::Path>& libraryDirList,
-					 const std::vector<FileSystemUtils::Path>& linkLibraryList,
-					 RCppOptimizationLevel optimizationLevel_,
-					 const char* pCompileOptions,
-					 const char* pLinkOptions,
-					 const FileSystemUtils::Path& outputFile )
+void Compiler::RunCompile(	const std::vector<FileSystemUtils::Path>&	filesToCompile_,
+							const CompilerOptions&						compilerOptions_,
+							std::vector<FileSystemUtils::Path>			linkLibraryList_,
+							const FileSystemUtils::Path&				moduleName_ )
 {
     if( m_pImplData->m_VSPath.empty() )
     {
@@ -310,18 +298,12 @@ void Compiler::RunCompile( const std::vector<FileSystemUtils::Path>& filesToComp
 	//optimization and c runtime
 #ifdef _DEBUG
 	std::string flags = "/nologo /Zi /FC /MDd /LDd ";
-	if( RCCPPOPTIMIZATIONLEVEL_DEFAULT == optimizationLevel_ )
-	{
-		optimizationLevel_ = RCCPPOPTIMIZATIONLEVEL_DEBUG;
-	}
 #else
 	std::string flags = "/nologo /Zi /FC /MD /LD ";	//also need debug information in release
-	if( RCCPPOPTIMIZATIONLEVEL_DEFAULT == optimizationLevel_ )
-	{
-		optimizationLevel_ = RCCPPOPTIMIZATIONLEVEL_PERF;
-	}
 #endif
-	switch( optimizationLevel_ )
+
+	RCppOptimizationLevel optimizationLevel = GetActualOptimizationLevel( compilerOptions_.optimizationLevel );
+	switch( optimizationLevel )
 	{
 	case RCCPPOPTIMIZATIONLEVEL_DEFAULT:
 		assert(false);
@@ -344,43 +326,49 @@ void Compiler::RunCompile( const std::vector<FileSystemUtils::Path>& filesToComp
 		m_pImplData->InitialiseProcess();
 	}
 
-	if( pCompileOptions )
-	{
-		flags += pCompileOptions;
-	}
+	flags += compilerOptions_.compileOptions;
+    flags += " ";
 
 	std::string linkOptions;
-	bool bHaveLinkOptions = pLinkOptions && strlen( pLinkOptions );
-	if( libraryDirList.size() ||  bHaveLinkOptions )
+	bool bHaveLinkOptions = ( 0 != compilerOptions_.linkOptions.length() );
+	if( compilerOptions_.libraryDirList.size() ||  bHaveLinkOptions )
 	{
 		linkOptions = " /link ";
-		for( size_t i = 0; i < libraryDirList.size(); ++i )
+		for( size_t i = 0; i < compilerOptions_.libraryDirList.size(); ++i )
 		{
-			linkOptions += " /LIBPATH:\"" + libraryDirList[i].m_string + "\"";
+			linkOptions += " /LIBPATH:\"" + compilerOptions_.libraryDirList[i].m_string + "\"";
 		}
 
 		if( bHaveLinkOptions )
 		{
-			linkOptions += pLinkOptions;
+			linkOptions += compilerOptions_.linkOptions;
+            linkOptions += " ";
 		}
 	}
+    // faster linking if available: https://randomascii.wordpress.com/2015/07/27/programming-is-puzzles/
+    #if   (_MSC_VER >= 1900)
+        if( linkOptions.empty() )
+        {
+            linkOptions = " /link ";
+        }
+        linkOptions += "/DEBUG:FASTLINK ";
+    #endif
 
 	// Check for intermediate directory, create it if required
 	// There are a lot more checks and robustness that could be added here
-	FileSystemUtils::Path intermediate = m_pImplData->m_intermediatePath;
-	if ( !intermediate.Exists() )
+	if ( !compilerOptions_.intermediatePath.Exists() )
 	{
-		bool success = intermediate.CreateDir();
-		if( success && m_pImplData->m_pLogger ) { m_pImplData->m_pLogger->LogInfo("Created intermediate folder \"%s\"\n",intermediate.c_str()); }
-		else if( m_pImplData->m_pLogger ) { m_pImplData->m_pLogger->LogError("Error creating intermediate folder \"%s\"\n",intermediate.c_str()); }
+		bool success = compilerOptions_.intermediatePath.CreateDir();
+		if( success && m_pImplData->m_pLogger ) { m_pImplData->m_pLogger->LogInfo("Created intermediate folder \"%s\"\n", compilerOptions_.intermediatePath.c_str()); }
+		else if( m_pImplData->m_pLogger ) { m_pImplData->m_pLogger->LogError("Error creating intermediate folder \"%s\"\n", compilerOptions_.intermediatePath.c_str()); }
 	}
 
 
 	//create include path search string
 	std::string strIncludeFiles;
-	for( size_t i = 0; i < includeDirList.size(); ++i )
+	for( size_t i = 0; i < compilerOptions_.includeDirList.size(); ++i )
 	{
-		strIncludeFiles += " /I \"" + includeDirList[i].m_string + "\"";
+		strIncludeFiles += " /I \"" + compilerOptions_.includeDirList[i].m_string + "\"";
 	}
 
 
@@ -391,9 +379,9 @@ void Compiler::RunCompile( const std::vector<FileSystemUtils::Path>& filesToComp
 	// Create compile path search string
 	std::string strFilesToCompile;
 	std::set<std::string> filteredPaths;
-	for( size_t i = 0; i < filesToCompile.size(); ++i )
+	for( size_t i = 0; i < filesToCompile_.size(); ++i )
 	{
-		std::string strPath = filesToCompile[i].m_string;
+		std::string strPath = filesToCompile_[i].m_string;
 		FileSystemUtils::ToLowerInPlace(strPath);
 
 		std::set<std::string>::const_iterator it = filteredPaths.find(strPath);
@@ -405,9 +393,9 @@ void Compiler::RunCompile( const std::vector<FileSystemUtils::Path>& filesToComp
 	}
 
 	std::string strLinkLibraries;
-	for( size_t i = 0; i < linkLibraryList.size(); ++i )
+	for( size_t i = 0; i < linkLibraryList_.size(); ++i )
 	{
-		strLinkLibraries += " \"" + linkLibraryList[i].m_string + "\" ";
+		strLinkLibraries += " \"" + linkLibraryList_[i].m_string + "\" ";
 	}
 	
 
@@ -420,8 +408,8 @@ char* pCharTypeFlags = "";
 
 	// /MP - use multiple processes to compile if possible. Only speeds up compile for multiple files and not link
 	std::string cmdToSend = "cl " + flags + pCharTypeFlags
-		+ " /MP /Fo\"" + intermediate.m_string + "\\\\\" "
-		+ "/D WIN32 /EHa /Fe" + outputFile.m_string;
+		+ " /MP /Fo\"" + compilerOptions_.intermediatePath.m_string + "\\\\\" "
+		+ "/D WIN32 /EHa /Fe" + moduleName_.m_string;
 	cmdToSend += " " + strIncludeFiles + " " + strFilesToCompile + strLinkLibraries + linkOptions
 		+ "\necho ";
 	if( m_pImplData->m_pLogger ) m_pImplData->m_pLogger->LogInfo( "%s", cmdToSend.c_str() ); // use %s to prevent any tokens in compile string being interpreted as formating
@@ -437,8 +425,8 @@ void GetPathsOfVisualStudioInstalls( std::vector<VSVersionInfo>* pVersions )
 
 	const size_t    NUMNAMESTOCHECK = 6;
 
-    // supporting: VS2005, VS2008, VS2010, VS2011, VS2013
-    std::string     valueName[NUMNAMESTOCHECK] = {"8.0","9.0","10.0","11.0","12.0","13.0"};
+    // supporting: VS2005, VS2008, VS2010, VS2011, VS2013, VS2015
+    std::string     valueName[NUMNAMESTOCHECK] = {"8.0","9.0","10.0","11.0","12.0","14.0"};
 
     // we start searching for a compatible compiler from the current version backwards
     int startVersion = NUMNAMESTOCHECK - 1;
@@ -461,7 +449,7 @@ void GetPathsOfVisualStudioInstalls( std::vector<VSVersionInfo>* pVersions )
 	case 1800:	//VS 2013
 		startVersion = 4;
 		break;
-	case 1900:	//VS 2014
+	case 1900:	//VS 2015
 		startVersion = 5;
 		break;
 	default:

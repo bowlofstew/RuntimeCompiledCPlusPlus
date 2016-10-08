@@ -21,7 +21,7 @@
 #if defined _WINDOWS_ && defined GetObject
 #undef GetObject
 #endif
-#include "../Common/AUArray.inl"
+#include "../RuntimeCompiler/AUArray.h"
 #include "../RuntimeCompiler/ICompilerLogger.h"
 #include "../RuntimeCompiler/FileChangeNotifier.h"
 #include "IObjectFactorySystem.h"
@@ -38,6 +38,22 @@
 
 using FileSystemUtils::Path;
 
+FileSystemUtils::Path RuntimeObjectSystem::ProjectSettings::ms_DefaultIntermediatePath;
+
+static Path GetIntermediateFolder( Path basePath_, RCppOptimizationLevel optimizationLevel_ )
+{
+	std::string folder;
+#ifdef _DEBUG
+	folder = "DEBUG_";
+#else
+	folder = "RELEASE_";
+#endif
+	folder +=  RCppOptimizationLevelStrings[ GetActualOptimizationLevel( optimizationLevel_ ) ];
+	Path runtimeFolder = basePath_ / folder;
+	return runtimeFolder;
+}
+
+
 RuntimeObjectSystem::RuntimeObjectSystem()
 	: m_pCompilerLogger(0)
 	, m_pSystemTable(0)
@@ -52,6 +68,7 @@ RuntimeObjectSystem::RuntimeObjectSystem()
     , m_pImpl( 0 )
     , m_CurrentlyBuildingProject( 0 )
 {
+    ProjectSettings::ms_DefaultIntermediatePath = FileSystemUtils::GetCurrentPath() / "Runtime";
     CreatePlatformImpl();
 }
 
@@ -95,8 +112,6 @@ bool RuntimeObjectSystem::Initialise( ICompilerLogger * pLogger, SystemTable* pS
 	includeDir = includeDir.ParentPath() / Path("RuntimeCompiler");
 	AddIncludeDir(includeDir.c_str());
 
-
-
 	return true;
 }
 
@@ -136,28 +151,20 @@ void RuntimeObjectSystem::OnFileChange(const IAUDynArray<const char*>& filelist)
             if( fileToBuild.filePath.Extension() != ".h" ) //TODO: change to check for .cpp and .c as could have .inc files etc.?
             {
                 bFindIncludeDependencies = false;
+                pBuildFileList->push_back( fileToBuild );
+
                 // file may be a source dependency, check
                 TFileToFilesIterator itrCurr = m_Projects[ proj ].m_RuntimeSourceDependencyMap.begin( );
                 while( itrCurr != m_Projects[ proj ].m_RuntimeSourceDependencyMap.end( ) )
                 {
                     if( itrCurr->second == fileToBuild.filePath )
                     {
-                        fileToBuild.filePath.ReplaceExtension( ".h" );
-                        bFindIncludeDependencies = true;
-                        bForceIncludeDependencies = false; // a src change, not a header change - so no need to force compile (can just link object file if exists)
-                        break;
+                        BuildTool::FileToBuild fileToBuild( itrCurr->first );
+                        pBuildFileList->push_back( fileToBuild );
                     }
-                    else
-                    {
-                        ++itrCurr;
-                    }
+                    ++itrCurr;
                 }
-
-                if( !bFindIncludeDependencies )
-                {
-                    pBuildFileList->push_back( fileToBuild );
-                }
-            }
+           }
 
             if( bFindIncludeDependencies )
             {
@@ -342,15 +349,13 @@ void RuntimeObjectSystem::StartRecompile()
 		}
 	}
 
+	m_Projects[ project ].m_CompilerOptions.intermediatePath = GetIntermediateFolder(	m_Projects[ project ].m_CompilerOptions.baseIntermediatePath,
+																						m_Projects[ project ].m_CompilerOptions.optimizationLevel );
 
-	m_pBuildTool->BuildModule(	ourBuildFileList,
-                                m_Projects[ project ].m_IncludeDirList,
-                                m_Projects[ project ].m_LibraryDirList,
-								linkLibraryList,
-								m_Projects[ project ].m_OptimizationLevel,
-                                m_Projects[ project ].m_CompileOptions.c_str( ),
-                                m_Projects[ project ].m_LinkOptions.c_str( ),
-								m_CurrentlyCompilingModuleName );
+
+    m_pBuildTool->BuildModule(  ourBuildFileList,
+                                m_Projects[ project ].m_CompilerOptions,
+								linkLibraryList, m_CurrentlyCompilingModuleName );
 }
 
 bool RuntimeObjectSystem::LoadCompiledModule()
@@ -498,12 +503,12 @@ void RuntimeObjectSystem::SetupRuntimeFileTracking(const IAUDynArray<IObjectCons
 			const char* pIncludeFile = constructors_[i]->GetIncludeFile(includeNum);
 			if( pIncludeFile )
 			{
-                FileSystemUtils::Path fullpath = compileDir / pIncludeFile;
-                fullpath = FindFile( fullpath.GetCleanPath() );
+                FileSystemUtils::Path pathInc = compileDir / pIncludeFile;
+                pathInc = FindFile( pathInc.GetCleanPath() );
 				TFileToFilePair includePathPair;
-				includePathPair.first = fullpath;
+				includePathPair.first = pathInc;
 				includePathPair.second = filePath;
-                AddToRuntimeFileList( fullpath.c_str(), projectId );
+                AddToRuntimeFileList( pathInc.c_str(), projectId );
                 project.m_RuntimeIncludeMap.insert( includePathPair );
 			}
 		}
@@ -527,25 +532,58 @@ void RuntimeObjectSystem::SetupRuntimeFileTracking(const IAUDynArray<IObjectCons
         //add source dependency file mappings
 		for (size_t num = 0; num <= constructors_[i]->GetMaxNumSourceDependencies(); ++num)
 		{
-			const char* pSourceDependency = constructors_[i]->GetSourceDependency(num);
-			if( pSourceDependency )
+			SourceDependencyInfo sourceDependency = constructors_[i]->GetSourceDependency(num);
+			FileSystemUtils::Path pathInc[2];	// array of potential include files for later checks
+			if( sourceDependency.filename )
 			{
-                FileSystemUtils::Path pathInc = compileDir / pSourceDependency;
-                pathInc = FindFile( pathInc.GetCleanPath() );
-                FileSystemUtils::Path pathSrc = pathInc;
-                pathSrc.ReplaceExtension( ".cpp" );
+				FileSystemUtils::Path pathSrc;
+				if( sourceDependency.relativeToPath )
+				{
+					pathSrc = sourceDependency.relativeToPath;
+					if( pathSrc.HasExtension() )
+					{
+						pathInc[1] = compileDir / pathSrc;
+						pathSrc =  compileDir / pathSrc.ParentPath() / sourceDependency.filename;
+					}
+					else
+					{
+						pathSrc =  compileDir / pathSrc / sourceDependency.filename;
+					}
+				}
+				else
+				{
+					pathSrc = compileDir / sourceDependency.filename;
+				}
+                pathSrc.ToOSCanonicalCase();
+                pathSrc = pathSrc.DelimitersToOSDefault();
+                pathSrc = pathSrc.GetCleanPath();
+				pathInc[0] = pathSrc;
+				if( sourceDependency.extension )
+				{
+					pathSrc.ReplaceExtension( sourceDependency.extension );
+				}
+				pathSrc = FindFile( pathSrc.GetCleanPath() );
 				TFileToFilePair sourcePathPair;
 				sourcePathPair.first = filePath;
 				sourcePathPair.second = pathSrc;
                 project.m_RuntimeSourceDependencyMap.insert( sourcePathPair );
                 
                 // if the include file with a source dependancy is logged as an runtime include, then we mark this .cpp as compile dependencies on change
-                TFileToFilesEqualRange range = project.m_RuntimeIncludeMap.equal_range( pathInc );
-                if( range.first != range.second )
-                {
-                    // add source file to runtime file list
-                    AddToRuntimeFileList( pathSrc.c_str(), projectId );
-                }
+				for( int inc=0; inc<2; ++inc )
+				{
+					TFileToFilesEqualRange range = project.m_RuntimeIncludeMap.equal_range( pathInc[inc] );
+					if( range.first != range.second )
+					{
+						// add source file to runtime file list
+						AddToRuntimeFileList( pathSrc.c_str(), projectId );
+
+						// also add this as a source dependency, so it gets force compiled on change of header (and not just compiled)
+						TFileToFilePair includePathPair;
+						includePathPair.first = pathInc[inc];
+						includePathPair.second = pathSrc;
+						project.m_RuntimeIncludeMap.insert( includePathPair );
+					}
+				}
 			}
 		}
 	}
@@ -566,33 +604,60 @@ RuntimeObjectSystem::ProjectSettings& RuntimeObjectSystem::GetProject( unsigned 
 
 void RuntimeObjectSystem::AddIncludeDir( const char *path_, unsigned short projectId_ )
 {
-    GetProject( projectId_).m_IncludeDirList.push_back( path_ );
+    GetProject( projectId_).m_CompilerOptions.includeDirList.push_back( path_ );
 }
 
 
 void RuntimeObjectSystem::AddLibraryDir( const char *path_, unsigned short projectId_ )
 {
-    GetProject( projectId_ ).m_LibraryDirList.push_back( path_ );
+    GetProject( projectId_ ).m_CompilerOptions.libraryDirList.push_back( path_ );
 }
 
 void RuntimeObjectSystem::SetAdditionalCompileOptions( const char *options, unsigned short projectId_ )
 {
-    GetProject( projectId_ ).m_CompileOptions = options;
+    GetProject( projectId_ ).m_CompilerOptions.compileOptions = options;
+}
+
+void RuntimeObjectSystem::SetCompilerLocation( const char *path, unsigned short projectId_ )
+{
+    GetProject( projectId_ ).m_CompilerOptions.compilerLocation = path;
 }
 
 void RuntimeObjectSystem::SetAdditionalLinkOptions( const char *options, unsigned short projectId_ )
 {
-    GetProject( projectId_ ).m_LinkOptions = options;
+    GetProject( projectId_ ).m_CompilerOptions.linkOptions = options;
 }
 
 void RuntimeObjectSystem::SetOptimizationLevel( RCppOptimizationLevel optimizationLevel_,	unsigned short projectId_ )
 {
-    GetProject( projectId_ ).m_OptimizationLevel = optimizationLevel_;
+    GetProject( projectId_ ).m_CompilerOptions.optimizationLevel = optimizationLevel_;
 }
 
 RCppOptimizationLevel RuntimeObjectSystem::GetOptimizationLevel(					unsigned short projectId_ )
 {
-	return GetProject( projectId_ ).m_OptimizationLevel;
+	return GetProject( projectId_ ).m_CompilerOptions.optimizationLevel;
+}
+
+void RuntimeObjectSystem::SetIntermediateDir(            const char* path_,      unsigned short projectId_ )
+{
+	GetProject( projectId_ ).m_CompilerOptions.baseIntermediatePath = path_;
+}
+
+void RuntimeObjectSystem::CleanObjectFiles() const
+{
+    if( m_pBuildTool )
+    {
+		for( unsigned short proj = 0; proj < m_Projects.size(); ++proj )
+		{
+			for( int optimizationLevel = 0;
+					optimizationLevel < RCCPPOPTIMIZATIONLEVEL_SIZE;
+					++optimizationLevel )
+			{
+				Path intermediateFolder = GetIntermediateFolder( m_Projects[ proj ].m_CompilerOptions.baseIntermediatePath, RCppOptimizationLevel( optimizationLevel ) );
+				m_pBuildTool->Clean( intermediateFolder );
+			}
+		}
+    }
 }
 
 FileSystemUtils::Path RuntimeObjectSystem::FindFile( const FileSystemUtils::Path& input )

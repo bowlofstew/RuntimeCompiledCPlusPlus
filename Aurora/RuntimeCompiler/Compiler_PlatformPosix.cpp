@@ -28,6 +28,10 @@
 #include <string>
 #include <vector>
 #include <iostream>
+
+#include <fstream>
+#include <sstream>
+
 #include "assert.h"
 #include <sys/wait.h>
 
@@ -50,7 +54,6 @@ public:
         m_PipeStdErr[1] = 1;
 	}
 
-	std::string			m_intermediatePath;
 	volatile bool		m_bCompileIsComplete;
 	ICompilerLogger*	m_pLogger;
     pid_t               m_ChildForCompilationPID;
@@ -65,6 +68,7 @@ Compiler::Compiler()
 
 Compiler::~Compiler()
 {
+	delete m_pImplData;
 }
 
 std::string Compiler::GetObjectFileExtension() const
@@ -118,25 +122,30 @@ void Compiler::Initialise( ICompilerLogger * pLogger )
 {
     m_pImplData = new PlatformCompilerImplData;
     m_pImplData->m_pLogger = pLogger;
-	m_pImplData->m_intermediatePath = "./Runtime";
 }
 
-FileSystemUtils::Path Compiler::GetRuntimeIntermediatePath() const
-{
-    return m_pImplData->m_intermediatePath;
-}
+void Compiler::RunCompile( const std::vector<FileSystemUtils::Path>&	filesToCompile_,
+			   const CompilerOptions&			compilerOptions_,
+			   std::vector<FileSystemUtils::Path>		linkLibraryList_,
+			    const FileSystemUtils::Path&		moduleName_ )
 
-void Compiler::RunCompile( const std::vector<FileSystemUtils::Path>& filesToCompile,
-					 const std::vector<FileSystemUtils::Path>& includeDirList,
-					 const std::vector<FileSystemUtils::Path>& libraryDirList,
-                     const std::vector<FileSystemUtils::Path>& linkLibraryList,
-                     RCppOptimizationLevel optimizationLevel_,
-					 const char* pCompileOptions,
-					 const char* pLinkOptions,
-					 const FileSystemUtils::Path& outputFile )
 {
+    const std::vector<FileSystemUtils::Path>& includeDirList = compilerOptions_.includeDirList;
+    const std::vector<FileSystemUtils::Path>& libraryDirList = compilerOptions_.libraryDirList;
+    const char* pCompileOptions =  compilerOptions_.compileOptions.c_str();
+    const char* pLinkOptions = compilerOptions_.linkOptions.c_str();
+
+    std::string compilerLocation = compilerOptions_.compilerLocation.m_string;
+    if (compilerLocation.size()==0){
+#ifdef __clang__
+        compilerLocation = "clang++ ";
+#else // default to g++
+        compilerLocation = "g++ ";
+#endif //__clang__
+    }
+
     //NOTE: Currently doesn't check if a prior compile is ongoing or not, which could lead to memory leaks
- 	m_pImplData->m_bCompileIsComplete = false;
+	m_pImplData->m_bCompileIsComplete = false;
     
     //create pipes
     if ( pipe( m_pImplData->m_PipeStdOut ) != 0 )
@@ -185,26 +194,14 @@ void Compiler::RunCompile( const std::vector<FileSystemUtils::Path>& filesToComp
     close( m_pImplData->m_PipeStdErr[0] );
     m_pImplData->m_PipeStdErr[0] = 0;
 
-#ifdef __APPLE__
-        std::string compileString = "clang++ -g -fvisibility=hidden -Xlinker -dylib ";
-#else
-	std::string compileString = "g++ -g -fPIC -fvisibility=hidden -shared ";
-#endif //__APPLE__
+	std::string compileString = compilerLocation + " " + "-g -fPIC -fvisibility=hidden -shared ";
 
 #ifndef __LP64__
 	compileString += "-m32 ";
 #endif
 
-	if( RCCPPOPTIMIZATIONLEVEL_DEFAULT == optimizationLevel_ )
-	{
-	#ifdef DEBUG
-		optimizationLevel_ = RCCPPOPTIMIZATIONLEVEL_DEBUG;
-	#else
-		optimizationLevel_ = RCCPPOPTIMIZATIONLEVEL_PERF;
-	#endif
-	}
-	
-	switch( optimizationLevel_ )
+	RCppOptimizationLevel optimizationLevel = GetActualOptimizationLevel( compilerOptions_.optimizationLevel );
+	switch( optimizationLevel )
 	{
 	case RCCPPOPTIMIZATIONLEVEL_DEFAULT:
 		assert(false);
@@ -216,6 +213,26 @@ void Compiler::RunCompile( const std::vector<FileSystemUtils::Path>& filesToComp
 		break;
 	case RCCPPOPTIMIZATIONLEVEL_NOT_SET:;
 	}
+    
+	// Check for intermediate directory, create it if required
+	// There are a lot more checks and robustness that could be added here
+	if( !compilerOptions_.intermediatePath.Exists() )
+	{
+		bool success = compilerOptions_.intermediatePath.CreateDir();
+		if( success && m_pImplData->m_pLogger ) { m_pImplData->m_pLogger->LogInfo("Created intermediate folder \"%s\"\n", compilerOptions_.intermediatePath.c_str()); }
+		else if( m_pImplData->m_pLogger ) { m_pImplData->m_pLogger->LogError("Error creating intermediate folder \"%s\"\n", compilerOptions_.intermediatePath.c_str()); }
+	}
+
+	FileSystemUtils::Path	output = moduleName_;
+	bool bCopyOutput = false;
+	if( compilerOptions_.intermediatePath.Exists() )
+	{
+		// add save object files
+        compileString = "cd \"" + compilerOptions_.intermediatePath.m_string + "\"\n" + compileString + " --save-temps ";
+		output = compilerOptions_.intermediatePath / "a.out";
+		bCopyOutput = true;
+	}
+	
 	
     // include directories
     for( size_t i = 0; i < includeDirList.size(); ++i )
@@ -230,32 +247,42 @@ void Compiler::RunCompile( const std::vector<FileSystemUtils::Path>& filesToComp
         compileString += "-F\"" + libraryDirList[i].m_string + "\" ";
     }
     
-    // output file
-    compileString += "-o " + outputFile.m_string + " ";
+	if( !bCopyOutput )
+	{
+	    // output file
+	    compileString += "-o " + output.m_string + " ";
+	}
 
 
 	if( pCompileOptions )
 	{
 		compileString += pCompileOptions;
+		compileString += " ";
 	}
 	if( pLinkOptions && strlen(pLinkOptions) )
 	{
 		compileString += "-Wl,";
 		compileString += pLinkOptions;
+		compileString += " ";
 	}
 	
     // files to compile
-    for( size_t i = 0; i < filesToCompile.size(); ++i )
-	{
-        compileString += "\"" + filesToCompile[i].m_string + "\" ";
+    for( size_t i = 0; i < filesToCompile_.size(); ++i )
+    {
+        compileString += "\"" + filesToCompile_[i].m_string + "\" ";
     }
     
     // libraries to link
-    for( size_t i = 0; i < linkLibraryList.size(); ++i )
-	{
-        compileString += " " + linkLibraryList[i].m_string + " ";
+    for( size_t i = 0; i < linkLibraryList_.size(); ++i )
+    {
+        compileString += " " + linkLibraryList_[i].m_string + " ";
     }
-    
+
+	if( bCopyOutput )
+	{
+        compileString += "\n mv \"" + output.m_string + "\" \"" + moduleName_.m_string + "\"\n";
+	}
+
     
     std::cout << compileString << std::endl << std::endl;
 
